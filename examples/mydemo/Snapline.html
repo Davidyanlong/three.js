@@ -1,0 +1,1569 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+	<title>three.js snapline</title>
+	<meta charset="utf-8" />
+	<meta name="viewport" content="width=device-width, user-scalable=no, minimum-scale=1.0, maximum-scale=1.0" />
+	<link type="text/css" rel="stylesheet" href="main.css" />
+	<style type="text/css">
+		body {
+			background-color: #000;
+			margin: 0px;
+			overflow: hidden;
+		}
+
+	</style>
+
+</head>
+
+<body>
+	<script async src="https://unpkg.com/es-module-shims@1.8.0/dist/es-module-shims.js"></script>
+	<script type="importmap">
+		{
+			"imports": {
+				"three": "../../build/three.module.js",
+				"three/addons/": "../jsm/"
+			}
+		}
+	</script>
+
+	<script type="module">
+
+		import * as THREE from "three";
+
+		import { OrbitControls } from "three/addons/controls/OrbitControls.js";
+		import { TransformControls } from "three/addons/controls/TransformControls.js";
+
+			let camera, scene, renderer, orbitControls, raycaster, pointer;
+			let transformControls, isClick,  box, lastAttach, vector3, positions;
+			let meshArray,
+			isRaycaster = false,
+			objectMap = new WeakMap(),
+			elementToMatrix = new WeakMap(),
+			vertical,
+			horizontal;
+			// 一些控制常量
+			// 测试box个数
+			const BoxCount = 4;
+
+			// 球体个数
+			const SphereCount = 4;
+			
+			// 吸附距离，如果很小可能对不齐，建议最小1
+			const tolerance = 10;
+			
+			// 吸附敏感度调节
+			const sensitivity = 200
+
+			// 开启全场景匹配， 会抓取所有可对齐点，效率低
+			const fullMatch = false
+
+			// 是否显示包围盒
+			const isShowBoundBox = false
+
+			// 线条颜色
+			const lineColor = '#ff00ff'
+
+			// 是否开启log 
+			const logEnable = true
+
+			
+			// 变换工具
+			class MyTransformControls extends TransformControls {
+				pointerMove(pointer) {
+					super.pointerMove(pointer);
+					if ( this.object === undefined || this.axis === null || this.dragging === false || pointer.button !== -1) return;
+					if (this.mode === "translate") {
+						// 扩展 move 事件
+						this.dispatchEvent({ type: "move" });
+					}
+				}
+			}
+
+
+			const lineData = [
+				[-1,  1, 1], // 左上前
+				[ 1,  1, 1], // 右上前
+
+				[-1,  1, -1], // 左上后
+				[ 1, 1, -1], // 右上后
+
+				[-1, -1, 1], // 左下前
+				[ 1, -1, 1], // 右下前
+
+				[-1, -1, -1], // 左下后
+				[ 1, -1, -1], // 右下后
+
+			];
+
+			// 根据地面的位置计算
+
+			const bottomFace = lineData.filter((item) => item[1] === -1);
+			init();
+			// 添加测试数据
+			createObject()
+
+			// 渲染
+			animate();
+
+
+			// 如果有哪些物体不参与对齐可以用这个方法进行过滤
+			function filter(obj){
+				// 用户传递的逻辑判断
+				return false
+			}
+
+			// 不进行计算
+			function isIgnored(obj, target){
+				return obj.id=== target.id || 
+				filter(target)
+			}
+
+			function createObject(){
+				meshArray = []
+				addBox();
+				addSphere()
+			}
+
+			function log(...args){
+				logEnable && console.log(...args)
+			}
+			
+			// 绘制
+			const _drawLine = (position, isVertical)=>{
+				let obj = isVertical?vertical:horizontal
+				if(!obj){
+					const bufferAttribute = new THREE.Float32BufferAttribute(position, 3);
+					bufferAttribute.setUsage(THREE.DynamicDrawUsage)
+					const bufferGeometry = new THREE.BufferGeometry();
+					bufferGeometry.setAttribute("position", bufferAttribute);
+					
+					obj = new THREE.Line(
+						bufferGeometry,
+						new THREE.LineBasicMaterial({ 
+							color: lineColor,
+							transparent:true,
+							depthWrite:false,
+							depthTest:false 
+						})
+					);
+					if(isVertical){
+						vertical = obj
+					}else{
+						horizontal = obj
+					}
+					scene.add(obj);
+				}else{
+					obj.visible = true
+					const bufferAttribute = obj.geometry.getAttribute("position")
+					bufferAttribute.set(position)
+					bufferAttribute.needsUpdate = true
+				}
+			}
+
+
+			/**
+			 * 绘制对齐线
+			*/
+			function drawLine({
+					verticalLeft,
+					verticalDepth,
+					verticalStart,
+					horizontalDepth,
+					horizontalLeft,
+					horizontalStart
+				}){
+
+					if(!verticalLeft) {
+						vertical && (vertical.visible = false)
+					}else{
+						let position = [
+							verticalLeft, verticalStart.y, verticalDepth,
+							...(verticalStart.toArray())
+						]	
+						_drawLine(position, true)
+						
+					}
+
+					// log('horizontalDepth', horizontalDepth)
+					
+					if(!horizontalDepth) {
+						horizontal && (horizontal.visible = false)
+					}else{
+						const position = [
+							horizontalLeft, horizontalStart.y, horizontalDepth,
+							...(horizontalStart.toArray())
+						]	
+						_drawLine(position, false)
+					}	
+
+				}
+
+				function adsorb(){
+					transformControls.enabled = false
+					setTimeout(()=>{
+						transformControls.enabled = true
+					},sensitivity)
+				}
+
+				function _fullMatchCompute({
+					verticalLeft,
+					verticalDepth,
+					verticalStart,
+					horizontalDepth,
+					horizontalLeft,
+					horizontalStart,
+					verticalFix, 
+				    horizontalFix, 
+					nodeCenter
+				}){
+				if(fullMatch){
+				let verticalDepthmin=Infinity, verticalDepthmax = -Infinity
+			   	let horizontalLeftmin=Infinity, horizontalLeftmax = -Infinity
+				if( (verticalLeft!==null|| horizontalDepth!==null)){
+					// log(meshArray.length)
+					for(let i=0,len=meshArray.length;i<len;i++){
+						let targetObj = meshArray[i]
+						const snapBBox  = targetObj.userData.aabb
+						const snapCenter = snapBBox.getCenter(new THREE.Vector3())
+						const snapLeftBottom = snapBBox.min
+						const snapRightTop = snapBBox.max
+						if(verticalFix === 0.5 && verticalLeft===snapCenter.x){
+							verticalDepthmin = Math.min(verticalDepthmin, snapCenter.z)
+							verticalDepthmax = Math.max(verticalDepthmax, snapCenter.z)
+							
+						}else if(verticalLeft===snapLeftBottom.x || verticalLeft===snapRightTop.x){// verticalFix === 1  || verticalFix === 0
+							verticalDepthmin = Math.min(verticalDepthmin, snapLeftBottom.z, snapRightTop.z)
+							verticalDepthmax = Math.max(verticalDepthmax, snapLeftBottom.z, snapRightTop.z)
+						}
+
+						if(horizontalFix === 0.5 && horizontalDepth===snapCenter.z){
+							horizontalLeftmin = Math.min(horizontalLeftmin, snapCenter.x)
+							horizontalLeftmax = Math.max(horizontalLeftmax, snapCenter.x)
+							
+						}else if(horizontalDepth=== snapRightTop.z || horizontalDepth=== snapLeftBottom.z){// verticalFix === 1  || verticalFix === 0
+							horizontalLeftmin = Math.min(horizontalLeftmin, snapRightTop.x, snapLeftBottom.x)
+							horizontalLeftmax = Math.max(horizontalLeftmax, snapRightTop.x, snapLeftBottom.x)
+							// log(horizontalDepth)
+						}
+						
+
+					}
+					verticalDepthmin = Math.min(verticalDepthmin, nodeCenter.z)
+					verticalDepthmax = Math.max(verticalDepthmax, nodeCenter.z)
+
+					horizontalLeftmin = Math.min(horizontalLeftmin, nodeCenter.x)
+					horizontalLeftmax = Math.max(horizontalLeftmax, nodeCenter.x)
+
+					// log(horizontalLeftmin, horizontalLeftmax)
+			   }
+			   if(verticalDepthmin!==Infinity && verticalDepthmax !== -Infinity){
+						verticalDepth = verticalDepthmin
+						verticalStart.z = verticalDepthmax
+				}	
+
+				if( horizontalLeftmin !==Infinity && horizontalLeftmax !== -Infinity){
+						horizontalLeft = horizontalLeftmax
+						horizontalStart.x = horizontalLeftmin 
+						// log('====', horizontalLeftmin, horizontalLeftmax)
+				}
+
+			   }
+				return {
+					verticalLeft,
+					verticalDepth,
+					verticalStart,
+					horizontalDepth,
+					horizontalLeft,
+					horizontalStart
+				}
+			   
+			   
+			}
+
+			// 寻找对齐点
+
+			// https://github.com/antvis/X6/blob/master/packages/x6-plugin-snapline/src/snapline.ts
+
+			// https://x6.antv.antgroup.com/tutorial/plugins/snapline
+
+			// https://x6.antv.antgroup.com/examples/showcase/practices#flowchart
+
+			// https://campus.thingjs.com/#/zh
+
+			function findAlign(obj) {
+
+				updateAABB(obj)
+
+				const targetBox = obj.userData.aabb
+
+				const nodeCenter = targetBox.getCenter(new THREE.Vector3())
+				const size = targetBox.getSize(new THREE.Vector3())
+				
+				const  nodeLeftBottom = targetBox.min
+				const  nodeRightTop = targetBox.max
+				// log(center)
+
+				const distance = tolerance || 0
+				let verticalLeft = null
+				let verticalDepth = null
+				let horizontalDepth = null
+				let horizontalLeft = null
+				let verticalFix = null 
+				let horizontalFix = null 
+
+				// some满足条件即停止查找
+				meshArray.some(targetObj=>{
+					if(isIgnored(obj,targetObj)){
+						return false
+					}
+
+					const snapBBox  = targetObj.userData.aabb
+					const snapCenter = snapBBox.getCenter(new THREE.Vector3())
+					const snapLeftBottom = snapBBox.min
+					const snapRightTop = snapBBox.max
+					if (verticalLeft == null) {
+						// log(Math.abs(snapCenter.x - nodeCenter.x))
+						if (Math.abs(snapCenter.x - nodeCenter.x) <= distance) {
+							// 居中对齐
+							verticalLeft = snapCenter.x
+							verticalFix = 0.5
+							log('纵向居中对齐')
+						}else if(Math.abs(snapLeftBottom.x - nodeLeftBottom.x) <= distance){
+							// 左对齐
+							verticalLeft = snapLeftBottom.x
+							verticalFix = 0
+
+							log('左边对齐')
+						}else if(Math.abs(snapLeftBottom.x - nodeRightTop.x) <= distance){
+							// 左边与右边对齐
+							verticalLeft = snapLeftBottom.x
+							verticalFix = 1
+
+							log('左边与右边对齐')
+						}else if(Math.abs(snapRightTop.x - nodeRightTop.x) <= distance){
+							// 右边与右边对齐
+							verticalLeft = snapRightTop.x
+							verticalFix = 1
+
+							log('右边与右边对齐')
+						}else if(Math.abs(snapRightTop.x - nodeLeftBottom.x) <= distance){
+							// 右边与左边对齐
+							verticalLeft = snapRightTop.x
+							verticalFix = 0
+
+							log('右边与左边对齐')
+						}
+					
+
+						if(verticalLeft!==null){
+							// log(targetObj.id)
+							verticalDepth = verticalFix === 0.5 ? 
+								snapCenter.z : 
+								nodeCenter.z > snapCenter.z ? 
+								snapLeftBottom.z : 
+								snapRightTop.z
+
+								obj.position.x = verticalFix === 0.5 ? 
+								verticalLeft : 
+								verticalFix === 1 ?
+								verticalLeft - size.x * 0.5 :
+								verticalLeft + size.x * 0.5	
+							
+						}
+
+					}
+
+					if(horizontalDepth===null){
+						// log(Math.abs(snapCenter.x - nodeCenter.x))
+						if (Math.abs(snapCenter.z - nodeCenter.z) <= distance) {
+							// 居中对齐
+							horizontalDepth = snapCenter.z
+							horizontalFix = 0.5
+							log('横向居中对齐')
+						}else if(Math.abs(snapRightTop.z - nodeRightTop.z) <= distance){
+							// 前边对齐
+							horizontalDepth = snapRightTop.z
+							horizontalFix = 0
+
+							log('前边对齐')
+						} else if(Math.abs(snapRightTop.z - nodeLeftBottom.z) <= distance){
+							// 前边与后边对齐
+							horizontalDepth = snapRightTop.z
+							horizontalFix = 1
+
+							log('前边与后边对齐')
+						}else if(Math.abs(snapLeftBottom.z - nodeLeftBottom.z) <= distance){
+							// 后边与后边对齐
+							horizontalDepth = snapLeftBottom.z
+							horizontalFix = 1
+
+							log('后边与后边对齐')
+						}else if(Math.abs(snapLeftBottom.z - nodeRightTop.z) <= distance){
+							// 后边与前边对齐
+							horizontalDepth = snapLeftBottom.z
+							horizontalFix = 0
+
+							log('后边与前边对齐')
+						}
+
+						if(horizontalDepth!==null){
+							horizontalLeft = horizontalFix === 0.5 ? 
+								snapCenter.x : 
+								nodeCenter.x > snapCenter.x ? 
+								snapLeftBottom.x : 
+								snapRightTop.x
+	
+								obj.position.z = horizontalFix === 0.5 ? 
+								horizontalDepth : 
+								horizontalFix === 1 ?
+								horizontalDepth + size.z * 0.5 :
+								horizontalDepth - size.z * 0.5	
+						}
+					}
+
+
+					if(verticalLeft != null || horizontalDepth != null){
+						// 吸附控制
+						adsorb()
+					}
+					
+					return verticalLeft != null && horizontalDepth != null
+				})
+
+
+
+				const verticalStart = new THREE.Vector3()
+				const horizontalStart = new THREE.Vector3()
+			
+			  
+				if(verticalFix === 0.5){
+					verticalStart.copy(nodeCenter)
+				}else if(verticalFix === 1){
+					verticalStart.set(
+						verticalLeft,
+						nodeCenter.y, 
+						verticalDepth > nodeCenter.z? nodeLeftBottom.z:nodeRightTop.z
+					)
+				}else{
+					verticalStart.set(
+						verticalLeft,
+						nodeCenter.y, 
+						verticalDepth > nodeCenter.z? nodeLeftBottom.z:nodeRightTop.z
+					)
+				}
+
+
+
+				if(horizontalFix === 0.5){
+					horizontalStart.copy(nodeCenter)
+				}else if(horizontalFix === 1){
+					horizontalStart.set(
+						horizontalLeft > nodeCenter.x? nodeLeftBottom.x:nodeRightTop.x,
+						nodeCenter.y, 
+						horizontalDepth
+						
+					)
+				}else{
+					horizontalStart.set(
+						horizontalLeft > nodeCenter.x? nodeLeftBottom.x:nodeRightTop.x,
+						nodeCenter.y, 
+						horizontalDepth
+					)
+				}
+
+				let {
+					verticalLeft:vf,
+					verticalDepth:vd,
+					verticalStart:vs,
+					horizontalDepth:hd,
+					horizontalLeft:hl,
+					horizontalStart:hs
+				} = _fullMatchCompute({
+					verticalLeft,
+					verticalDepth,
+					verticalStart,
+					horizontalDepth,
+					horizontalLeft,
+					horizontalStart,
+					verticalFix, 
+				    horizontalFix, 
+					nodeCenter
+				})
+		
+			  
+				drawLine({
+					verticalLeft:vf,
+					verticalDepth:vd,
+					verticalStart:vs,
+					horizontalDepth:hd,
+					horizontalLeft:hl,
+					horizontalStart:hs
+				})
+			}
+
+			
+
+
+			// 三维对象发生形变时，触发事件'change'
+			function bindTransformEvent(obj) {
+				let lastTarget = null;
+				let timer = null;
+				function changeEvent(target) {
+
+					// 防止多次出发
+					timer && clearTimeout(timer);
+					timer = setTimeout(() => {
+						obj.dispatchEvent({ type: "change" });
+					}, 16);
+
+				}
+
+				const origin = obj;
+				elementToMatrix.set(obj.matrix.elements, origin);
+
+				// 不考虑子部件被变换
+				obj.matrix.elements = new Proxy(obj.matrix.elements, {
+					get(target, propKey, receiver) {
+						return Reflect.get(target, propKey, receiver);
+					},
+
+					set(target, propKey, value, receiver) {
+						if (target[propKey] !== value) {
+							const obj = elementToMatrix.get(target);
+							changeEvent(obj);
+						}
+
+						target[propKey] = value;
+						return true;
+
+					},
+
+				});
+
+			}
+
+
+			function addBox() {
+				const boxGeometry = new THREE.BoxGeometry(1, 1, 1);
+				const random = (min = 10, max = 100) =>
+					Math.round(min + (max - min) * Math.random());
+
+				const createBox = () => {
+					const box = new THREE.Mesh(
+						boxGeometry,
+						new THREE.MeshStandardMaterial({ color: 0xffffff * Math.random() })
+					);
+
+					box.name = "box";
+					const y = random();
+					box.scale.set(random(20, 200), y, random(20, 200));
+					box.position.set(random(-1000, 1000), y / 2, random(-1000, 1000)),
+						(box.rotation.y = random(-Math.PI, Math.PI));
+					scene.add(box);
+					return box;
+				};
+
+				for (let i = 0; i < BoxCount; i++) {
+
+					let box = createBox();
+					updateAABB(box);
+					drawBoundBox(box);
+					meshArray.push(box);
+					bindTransformEvent(box);
+					box.addEventListener("change", (ev) => {
+						updateAABB(ev.target);
+						// log(ev.target);
+					});
+
+				}
+
+			}
+
+
+			// TODO: 添加球体对象
+			function addSphere() {
+				const boxGeometry = new THREE.SphereGeometry(1,64,64);
+				const random = (min = 10, max = 100) =>
+					Math.round(min + (max - min) * Math.random());
+
+				const createSphere = () => {
+					const sphere = new THREE.Mesh(
+						boxGeometry,
+						new THREE.MeshStandardMaterial({ color: 0xffffff * Math.random() })
+					);
+
+					sphere.name = "box";
+					const y = random()/2;
+					sphere.scale.set(y,y,y);
+					sphere.position.set(random(-1000, 1000), y, random(-1000, 1000)),
+					// sphere.rotation.y = random(-Math.PI, Math.PI);
+					scene.add(sphere);
+					return sphere;
+				};
+
+				for (let i = 0; i < SphereCount; i++) {
+					let sphere = createSphere();
+					updateAABB(sphere);
+					drawBoundBox(sphere);
+					meshArray.push(sphere);
+					bindTransformEvent(sphere);
+					sphere.addEventListener("change", (ev) => {
+						updateAABB(ev.target);
+						// log(ev.target);
+					});
+
+				}
+
+			}
+
+
+			// TODO: 物体发生形状变化时，需要重新计算包围盒与OBB
+			function updateAABB(obj) {
+				const userData = obj.userData ?? {};
+				box.makeEmpty();
+				// TODO: 对于一个复杂的三维模型，这里需要遍历各个mesh 再叠加
+
+				box.setFromObject(obj);
+				// 需要初始化
+
+				userData.aabb = box.clone()
+
+			}
+
+			// 绘制三维对象的包围盒
+			function drawBoundBox(obj) {
+			
+				const aabb = obj.userData.aabb;
+				const { Vector3 } = THREE;
+				const halfSize = aabb.getSize(new Vector3()).multiplyScalar(0.5)
+				const center = aabb.getCenter(new Vector3())
+				const points = lineData.map((point) => {
+
+					return [
+						point[0] * halfSize.x,
+						point[1] * halfSize.y,
+						point[2] * halfSize.z,
+					];
+
+				});
+
+				const position = points.flat();
+				const indexData = [
+
+					// 上面
+					0, 1, 1, 3, 3, 2, 2, 0,
+
+					// 下面
+					4, 5, 5, 7, 7, 6, 6, 4,
+
+					// 侧面
+					0, 4, 1, 5, 2, 6, 3, 7,
+				];
+
+				const bufferAttribute = new THREE.Float32BufferAttribute(position, 3);
+				const bufferGeometry = new THREE.BufferGeometry();
+				bufferGeometry.setAttribute("position", bufferAttribute);
+				bufferGeometry.setIndex(indexData);
+
+
+
+				// TODO: 后期优化提取公用材质
+				const color = new THREE.Color();
+				color.copy(obj.material.color);
+				color.convertLinearToSRGB();
+				const line = new THREE.LineSegments(
+					bufferGeometry,
+					new THREE.LineBasicMaterial({ color: color.getStyle() })
+				);
+
+				line.visible = isShowBoundBox;
+				// line.position.copy(center)
+
+				// log(center, center.clone().multiplyScalar(-1))
+				// const scale = new THREE.Vector3();
+				// scale.set(1, 1, 1);
+				// scale.divide(obj.getWorldScale(new THREE.Vector3()));
+				// line.scale.multiply(scale);
+			
+				// const quaternion = obj.getWorldQuaternion(new THREE.Quaternion())
+				// quaternion.invert().normalize()
+				// line.quaternion.identity()
+				// line.quaternion.set(quaternion.x, quaternion.y, quaternion.z, 0.5)
+
+				obj.addEventListener('change',()=>{
+					line.position.copy(obj.position)
+				})
+				line.position.copy(obj.position)
+				scene.add(line);
+
+				// line.rotation.set(0,0,0)
+				// obj.add(line)
+			}
+
+			// 初始化
+			function init() {
+
+				// 初始化相机
+				camera = new THREE.PerspectiveCamera(
+					40,
+					window.innerWidth / window.innerHeight,
+					1,
+					10000
+				);
+				camera.position.set(-200, 50, 400);
+				camera.lookAt(new THREE.Vector3(0, 0, 0));
+				// 初始化场景
+				scene = new THREE.Scene();
+				scene.fog = new THREE.Fog("#666", 50000, 150000);
+
+				// 初始化渲染器
+				renderer = new THREE.WebGLRenderer({ antialias: true });
+				renderer.setPixelRatio(window.devicePixelRatio);
+				renderer.setClearColor(new THREE.Color("#666"), 1);
+				renderer.clearColor();
+				renderer.setSize(window.innerWidth, window.innerHeight);
+				document.body.appendChild(renderer.domElement);
+
+				// 坐标轴
+				const axis = new THREE.AxesHelper(1000);
+				scene.add(axis);
+
+				// 初始化控制器
+				orbitControls = new OrbitControls(camera, renderer.domElement);
+				// 初始化灯光
+				// scene.add(new THREE.AmbientLight(0x222222))
+
+				var light = new THREE.DirectionalLight(0xffffff, 1);
+				light.position.set(80, 80, 80);
+				scene.add(light);
+				light = new THREE.DirectionalLight(0xffffff, 0.3);
+				light.position.set(-80, -80, -80);
+				scene.add(light);
+
+
+
+				// 初始化无限网格
+				const InfiniteGridHelper = initGrid();
+				const grid = new InfiniteGridHelper(10, 100);
+				scene.add(grid);
+
+				// 移动控制器
+				transformControls = new MyTransformControls(
+					camera,
+					renderer.domElement
+				);
+
+				transformControls.size = 0.5;
+				// transformControls.setTranslationSnap(0.1);
+
+				// 防止由于高度的调整，导致某些视角上看到线条绘制的不对，实际中可以不设置不显示Y轴
+				transformControls.showY = false;
+
+				transformControls.space = "world";
+				scene.add(transformControls);
+
+				// disable orbitControls while using transformControls
+				transformControls.addEventListener(
+					"mouseDown",
+					() => (orbitControls.enabled = false)
+				);
+
+				transformControls.addEventListener(
+					"mouseUp",
+					() => {
+						orbitControls.enabled = true
+						setTimeout(()=>{
+							vertical && (vertical.visible = false)
+							horizontal && (horizontal.visible = false)
+						},100)
+						
+					}
+				);
+
+				transformControls.addEventListener("move", (ev) => {
+					findAlign(ev.target.object);
+					// log('move', ev.target.object)
+				});
+
+
+				
+				// 拾取初始化
+				raycaster = new THREE.Raycaster();
+				pointer = new THREE.Vector2();
+				// 是否点击
+				isClick = false;
+				box = new THREE.Box3();
+				window.addEventListener("pointermove", onPointerMove);
+				window.addEventListener("click", () => (isClick = true));
+				window.addEventListener("resize", onWindowResize);
+			}
+
+
+
+			function onPointerMove(event) {
+				// 将鼠标位置归一化为设备坐标。x 和 y 方向的取值范围是 (-1 to +1)
+				pointer.x = (event.clientX / window.innerWidth) * 2 - 1;
+				pointer.y = -(event.clientY / window.innerHeight) * 2 + 1;
+			}
+
+
+			function onWindowResize() {
+				camera.aspect = window.innerWidth / window.innerHeight;
+				camera.updateProjectionMatrix();
+				renderer.setSize(window.innerWidth, window.innerHeight);
+			}
+
+			// 选中移动的物体
+			function selectObj(){
+				if (isClick) {
+					isClick = false;
+					isRaycaster = false
+					// 通过摄像机和鼠标位置更新
+					raycaster.setFromCamera(pointer, camera);
+
+					// 计算物体和射线的焦点
+					const intersects = raycaster.intersectObjects(scene.children);
+
+					if (intersects?.length > 0) {
+						for (let i = 0; i < intersects?.length; i++) {
+							if (intersects[i].object.name === "box") {
+								if (lastAttach) {
+									transformControls.detach();
+								}
+								transformControls.attach(intersects[i].object);
+								lastAttach = intersects[i].object;
+								isRaycaster = true
+								break;
+							}
+						}
+					}
+
+					if (lastAttach && !isRaycaster) {
+						transformControls.detach();
+					}
+					
+				}
+			}
+
+
+			function animate() {
+				requestAnimationFrame(animate);
+				selectObj()
+				renderer.render(scene, camera);
+			}
+
+			// 网格只是用来参考，本示例中可以忽略
+
+			function initGrid() {
+
+				// Author: Fyrestar https://mevedia.com (https://github.com/Fyrestar/THREE.InfiniteGridHelper)
+
+				let InfiniteGridHelper = function InfiniteGridHelper(
+
+					size1,
+
+					size2,
+
+					color,
+
+					distance,
+
+					axes = "xzy"
+
+				) {
+
+					color = color || new THREE.Color("white");
+
+
+
+					size1 = size1 || 10;
+
+
+
+					size2 = size2 || 100;
+
+
+
+					distance = distance || 8000;
+
+
+
+					const planeAxes = axes.substr(0, 2);
+
+
+
+					const geometry = new THREE.PlaneGeometry(2, 2, 1, 1);
+
+
+
+					const material = new THREE.ShaderMaterial({
+
+						side: THREE.DoubleSide,
+
+
+
+						uniforms: {
+
+							uSize1: {
+
+								value: size1,
+
+							},
+
+
+
+							uSize2: {
+
+								value: size2,
+
+							},
+
+
+
+							uColor: {
+
+								value: color,
+
+							},
+
+
+
+							uDistance: {
+
+								value: distance,
+
+							},
+
+						},
+
+
+
+						transparent: true,
+
+
+
+						vertexShader: `
+
+
+
+										
+
+
+
+										varying vec3 worldPosition;
+
+
+
+										
+
+
+
+										uniform float uDistance;
+
+
+
+										
+
+
+
+										void main() {
+
+
+
+										
+
+
+
+												vec3 pos = position.${axes} * uDistance;
+
+
+
+												pos.${planeAxes} += cameraPosition.${planeAxes};
+
+
+
+												
+
+
+
+												worldPosition = pos;
+
+
+
+												
+
+
+
+												gl_Position = projectionMatrix * modelViewMatrix * vec4(pos, 1.0);
+
+
+
+										
+
+
+
+										}
+
+
+
+										`,
+
+
+
+						fragmentShader: `
+
+
+
+										
+
+
+
+										varying vec3 worldPosition;
+
+
+
+										
+
+
+
+										uniform float uSize1;
+
+
+
+										uniform float uSize2;
+
+
+
+										uniform vec3 uColor;
+
+
+
+										uniform float uDistance;
+
+
+
+											
+
+
+
+											
+
+
+
+											
+
+
+
+											float getGrid(float size) {
+
+
+
+											
+
+
+
+												vec2 r = worldPosition.${planeAxes} / size;
+
+
+
+												
+
+
+
+												
+
+
+
+												vec2 grid = abs(fract(r - 0.5) - 0.5) / fwidth(r);
+
+
+
+												float line = min(grid.x, grid.y);
+
+
+
+												
+
+
+
+											
+
+
+
+												return 1.0 - min(line, 1.0);
+
+
+
+											}
+
+
+
+											
+
+
+
+										void main() {
+
+
+
+										
+
+
+
+												
+
+
+
+												float d = 1.0 - min(distance(cameraPosition.${planeAxes}, worldPosition.${planeAxes}) / uDistance, 1.0);
+
+
+
+												
+
+
+
+												float g1 = getGrid(uSize1);
+
+
+
+												float g2 = getGrid(uSize2);
+
+
+
+												
+
+
+
+												
+
+
+
+												gl_FragColor = vec4(uColor.rgb, mix(g2, g1, g1) * pow(d, 3.0));
+
+
+
+												gl_FragColor.a = mix(0.5 * gl_FragColor.a, gl_FragColor.a, g2);
+
+
+
+												
+
+
+
+												if ( gl_FragColor.a <= 0.0 ) discard;
+
+
+
+												
+
+
+
+										
+
+
+
+										}
+
+
+
+										
+
+
+
+										`,
+
+
+
+						extensions: {
+
+							derivatives: true,
+
+						},
+
+					});
+
+
+
+					THREE.Mesh.call(this, geometry, material);
+
+
+
+					this.frustumCulled = false;
+
+				};
+
+
+
+				InfiniteGridHelper.prototype = {
+
+					...THREE.Mesh.prototype,
+
+
+
+					...THREE.Object3D.prototype,
+
+
+
+					...THREE.EventDispatcher.prototype,
+
+				};
+
+
+
+				if (parseInt(THREE.REVISION) > 126) {
+
+					class InfiniteGridHelper2 extends THREE.Mesh {
+
+						constructor(size1, size2, color, distance, axes = "xzy") {
+
+							color = color || new THREE.Color("white");
+
+
+
+							size1 = size1 || 10;
+
+
+
+							size2 = size2 || 100;
+
+
+
+							distance = distance || 8000;
+
+
+
+							const planeAxes = axes.substr(0, 2);
+
+
+
+							const geometry = new THREE.PlaneGeometry(2, 2, 1, 1);
+
+
+
+							const material = new THREE.ShaderMaterial({
+
+								side: THREE.DoubleSide,
+
+
+
+								uniforms: {
+
+									uSize1: {
+
+										value: size1,
+
+									},
+
+
+
+									uSize2: {
+
+										value: size2,
+
+									},
+
+
+
+									uColor: {
+
+										value: color,
+
+									},
+
+
+
+									uDistance: {
+
+										value: distance,
+
+									},
+
+								},
+
+
+
+								transparent: true,
+
+
+
+								vertexShader: `
+
+
+
+										
+
+
+
+										varying vec3 worldPosition;
+
+
+
+										
+
+
+
+										uniform float uDistance;
+
+
+
+										
+
+
+
+										void main() {
+
+
+
+										
+
+
+
+												vec3 pos = position.${axes} * uDistance;
+
+
+
+												pos.${planeAxes} += cameraPosition.${planeAxes};
+
+
+
+												
+
+
+
+												worldPosition = pos;
+
+
+
+												
+
+
+
+												gl_Position = projectionMatrix * modelViewMatrix * vec4(pos, 1.0);
+
+
+
+										
+
+
+
+										}
+
+
+
+										`,
+
+
+
+								fragmentShader: `
+
+
+
+										
+
+
+
+										varying vec3 worldPosition;
+
+
+
+										
+
+
+
+										uniform float uSize1;
+
+
+
+										uniform float uSize2;
+
+
+
+										uniform vec3 uColor;
+
+
+
+										uniform float uDistance;
+
+
+
+											
+
+
+
+											
+
+
+
+											
+
+
+
+											float getGrid(float size) {
+
+
+
+											
+
+
+
+												vec2 r = worldPosition.${planeAxes} / size;
+
+
+
+												
+
+
+
+												
+
+
+
+												vec2 grid = abs(fract(r - 0.5) - 0.5) / fwidth(r);
+
+
+
+												float line = min(grid.x, grid.y);
+
+
+
+												
+
+
+
+											
+
+
+
+												return 1.0 - min(line, 1.0);
+
+
+
+											}
+
+
+
+											
+
+
+
+										void main() {
+
+
+
+										
+
+
+
+												
+
+
+
+												float d = 1.0 - min(distance(cameraPosition.${planeAxes}, worldPosition.${planeAxes}) / uDistance, 1.0);
+
+
+
+												
+
+
+
+												float g1 = getGrid(uSize1);
+
+
+
+												float g2 = getGrid(uSize2);
+
+
+
+												
+
+
+
+												
+
+
+
+												gl_FragColor = vec4(uColor.rgb, mix(g2, g1, g1) * pow(d, 3.0));
+
+
+
+												gl_FragColor.a = mix(0.5 * gl_FragColor.a, gl_FragColor.a, g2);
+
+
+
+												
+
+
+
+												if ( gl_FragColor.a <= 0.0 ) discard;
+
+
+
+												
+
+
+
+										
+
+
+
+										}
+
+
+
+										
+
+
+
+										`,
+
+
+
+								extensions: {
+
+									derivatives: true,
+
+								},
+
+							});
+
+
+
+							super(geometry, material);
+
+
+
+							this.frustumCulled = false;
+
+						}
+
+					}
+
+
+
+					Object.assign(
+
+						InfiniteGridHelper2.prototype,
+
+						InfiniteGridHelper.prototype
+
+					);
+
+
+
+					return InfiniteGridHelper2;
+
+				}
+
+
+
+				return InfiniteGridHelper;
+
+			}
+
+		</script>
+
+</body>
+
+</html>
